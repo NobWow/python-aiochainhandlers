@@ -6,7 +6,7 @@ from typing import MutableSequence, Coroutine, Callable, Any, Optional, AsyncGen
 
 class AIOHandlerChain:
     def __init__(self, *, event=asyncio.Event(), lock=asyncio.Lock()):
-        self._handlers: MutableSequence[Callable[(type(self), ...), Coroutine[Optional[bool]]]] = []
+        self._handlers: MutableSequence[Callable[(type(self), ...), Coroutine[Any, Any, Any]]] = []
         self._lock = lock
         self._evt = event
         self._before = asyncio.Condition(lock)
@@ -20,7 +20,7 @@ class AIOHandlerChain:
         else:
             pass
 
-    def add_handler(self, afunc: Callable[(Any, ), Coroutine[Any]]) -> bool:
+    def add_handler(self, afunc: Callable[(Any, ), Coroutine[Any, Any, Any]]) -> bool:
         if afunc not in self._handlers:
             self._handlers.insert(0, afunc)
             return True
