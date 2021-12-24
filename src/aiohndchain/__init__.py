@@ -6,7 +6,15 @@ from typing import MutableSequence, Coroutine, Callable, Any, Optional, AsyncGen
 
 class AIOHandlerChain:
     """
-    p
+    An implementation of event, but more advanced than regular asyncio.Event.
+    Before emitting an underlying asyncio.Event, handler chain is executed,
+    and if just one handler returns False, other handlers won't be executed
+    If one handler returns True, all handlers will be executed regardless if
+    next handlers returns False.
+    Also possible to wait on the event before the handlers called, or after
+    the handlers. There are two relying asyncio.Condition that are triggered
+    during emitting.
+    This class is callable, producing a coroutine for emitting an event
     """
     def __init__(self, *, event=asyncio.Event(), lock=asyncio.Lock()):
         self._handlers: MutableSequence[Callable[(type(self), ...), Coroutine[Any, Any, Any]]] = []
@@ -19,6 +27,10 @@ class AIOHandlerChain:
         self._ctxres: Optional[bool] = None
 
     def _ctxhandle(self, res: Optional[bool] = None) -> (bool, list, dict):
+        """
+        This method is returned by the asynchronous context manager.
+        Returns availability state and arguments, keyword arguments of the event.
+        """
         _res = True
         if self._ctxres is None and res is not None:
             self._ctxres = res
@@ -31,19 +43,47 @@ class AIOHandlerChain:
         pass
 
     def add_handler(self, afunc: Callable[(Any, ), Coroutine[Any, Any, Any]]) -> bool:
+        """
+        Add coroutine function to this handler chain.
+        Return True if successful, False otherwise
+        """
         if afunc not in self._handlers:
             self._handlers.insert(0, afunc)
             return True
         return False
 
     def remove_handler(self, afunc: Callable) -> bool:
+        """
+        Remove coroutine function from this handler chain.
+        Return True if successful, False otherwise
+        """
         if afunc in self._handlers:
             self._handlers.remove(afunc)
             return True
         return False
 
+    async def wait_for_successful(self):
+        """
+        Blocks until this event emits successfully.
+        Invokes wait() method on underlying event.
+        """
+        await self._evt.wait()
+
     @asynccontextmanager
     async def wait_and_handle(self, *, before=False) -> AsyncGenerator[Any, Callable[(Optional[bool], ), Tuple[bool, list, dict]]]:
+        """
+        Blocks until this event emits and returns a context manager with handle after
+        the handler chain.
+        The handle of returned context manager is callable: it returns a tuple with
+        3 values: bool, list, dict
+        First is True if this event is not cancelled, False otherwise
+        The handle can set the state of the execution: pass False to cancel this event,
+        and True to force this event to be dispatched successfully.
+        Others are positioned arguments and keyword arguments passed by emit().
+        If before=True, waits until this event emits before executing event handlers,
+        in this case when False is passed into handle, an entire handler chain won't
+        be executed and this event will be cancelled.
+        """
         _cond = self._before if before else self._after
         self.debug_print("wait_and_handle: before try")
         try:
@@ -55,10 +95,20 @@ class AIOHandlerChain:
         finally:
             _cond.release()
 
-    async def __call__(self, *args, **kwargs):
-        await self.emit(*args, **kwargs)
+    async def __call__(self, *args, **kwargs) -> bool:
+        """
+        Shorthand for self.emit(*args, **kwargs)
+        """
+        return await self.emit(*args, **kwargs)
 
-    async def emit(self, *args, **kwargs):
+    async def emit(self, *args, **kwargs) -> bool:
+        """
+        Execute the handler chain and proceed with underlying event trigger
+        in case of successful execution. Also triggers other tasks that are
+        waiting for this event with self.wait_and_handle()
+        Before acquiring the lock, it waits until this lock is completely unlocked.
+        Note: this function will block until all the handlers are executed.
+        """
         self._ctxres = res = None
         self._ctxargs.clear()
         self._ctxkwargs.clear()
@@ -88,7 +138,7 @@ class AIOHandlerChain:
                                 if not _res:
                                     break
                         except Exception as exc:
-                            await self.on_handler_error(hndid, exc)
+                            await self.on_handler_error(hndid, exc, *args, **kwargs)
             else:
                 self.debug_print("emit: _ctxres is False")
                 self._ctxargs.clear()
@@ -100,8 +150,6 @@ class AIOHandlerChain:
                 self.debug_print("emit: after lock wait...")
                 async with self._lock:
                     pass
-            self._evt.set()
-            self._evt.clear()
             self.debug_print("emit: end phase")
             if self._ctxres is not False:
                 self.debug_print("emit: checkout lock at the end")
@@ -112,25 +160,41 @@ class AIOHandlerChain:
                 res = self._ctxres
             if res is not False:
                 self.debug_print('emit: execute success')
-                await self.on_success()
+                self._evt.set()
+                self._evt.clear()
+                await self.on_success(*args, **kwargs)
+                return True
             else:
                 self.debug_print('emit: execute failure')
-                await self.on_failure()
+                await self.on_failure(*args, **kwargs)
+                return False
         except Exception as exc:
-            await self.on_error(exc)
+            await self.on_error(exc, *args, **kwargs)
 
-    async def on_success(self):
+    async def on_success(self, *args, **kwargs):
+        """
+        Executed by emit() in case of successful execution
+        """
         # override
         pass
 
-    async def on_failure(self):
+    async def on_failure(self, *args, **kwargs):
+        """
+        Executed by emit() in case of cancellation
+        """
         # override
         pass
 
-    async def on_error(self, exc: Exception):
+    async def on_error(self, exc: Exception, *args, **kwargs):
+        """
+        Executed by emit() in case of an exception in it
+        """
         # override
         pass
 
-    async def on_handler_error(self, hndid: int, exc: Exception):
+    async def on_handler_error(self, hndid: int, exc: Exception, *args, **kwargs):
+        """
+        Executed by emit() in case if one of the handlers fails to execute
+        """
         # override
         pass
