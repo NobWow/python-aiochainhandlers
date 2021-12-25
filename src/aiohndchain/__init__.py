@@ -16,15 +16,24 @@ class AIOHandlerChain:
     during emitting.
     This class is callable, producing a coroutine for emitting an event
     """
-    def __init__(self, *, event=asyncio.Event(), lock=asyncio.Lock()):
+    def __init__(self, *, event=asyncio.Event(), lock=asyncio.Lock(), cancellable=True):
         self._handlers: MutableSequence[Callable[(type(self), ...), Coroutine[Any, Any, Any]]] = []
         self._lock = lock
         self._evt = event
+        self._cancellable = cancellable
         self._before = asyncio.Condition(lock)
         self._after = asyncio.Condition(lock)
         self._ctxargs = []
         self._ctxkwargs = {}
         self._ctxres: Optional[bool] = None
+        self._emitlock = asyncio.Lock()
+
+    def isCancellable(self) -> bool:
+        """
+        Return True or False whether or not this handler chain is cancellable.
+        This is determined at the object's creation as cancellable keyword-only argument.
+        """
+        return self._cancellable
 
     def _ctxhandle(self, res: Optional[bool] = None) -> (bool, list, dict):
         """
@@ -32,7 +41,7 @@ class AIOHandlerChain:
         Returns availability state and arguments, keyword arguments of the event.
         """
         _res = True
-        if self._ctxres is None and res is not None:
+        if self._ctxres is None and res is not None and self._cancellable:
             self._ctxres = res
             _res = res
         elif self._ctxres is False:
@@ -113,61 +122,66 @@ class AIOHandlerChain:
         self._ctxargs.clear()
         self._ctxkwargs.clear()
         try:
-            async with self._before:
-                self.debug_print("emit: notifying _before")
-                self._before.notify_all()
-            self.debug_print("emit: checkout lock")
-            while self._lock.locked():
-                self.debug_print("emit: locked, waiting...")
-                async with self._lock:
-                    pass
-                self.debug_print("emit: unlocked, continuing?")
-            self._ctxargs.extend(args)
-            self._ctxkwargs.update(kwargs)
-            self.debug_print("emit: updated context args")
-            if self._ctxres is not False:
-                self.debug_print("emit: _ctxres is not False")
-                async with self._lock:
-                    self.debug_print("emit: handler lock acquired")
-                    for hndid in range(len(self._handlers)):
-                        handler = self._handlers[hndid]
-                        try:
-                            self._ctxres = _res = await handler(self, *args, **kwargs)
-                            if isinstance(_res, bool) and not res:
-                                res = _res
-                                if not _res:
-                                    break
-                        except Exception as exc:
-                            await self.on_handler_error(hndid, exc, *args, **kwargs)
-            else:
-                self.debug_print("emit: _ctxres is False")
-                self._ctxargs.clear()
-                self._ctxkwargs.clear()
-            async with self._after:
-                self.debug_print("emit: notifying _after")
-                self._after.notify_all()
-            while self._lock.locked():
-                self.debug_print("emit: after lock wait...")
-                async with self._lock:
-                    pass
-            self.debug_print("emit: end phase")
-            if self._ctxres is not False:
-                self.debug_print("emit: checkout lock at the end")
-                async with self._lock:
-                    pass
-                self.debug_print('emit: lock passed')
-            if isinstance(self._ctxres, bool):
-                res = self._ctxres
-            if res is not False:
-                self.debug_print('emit: execute success')
-                self._evt.set()
-                self._evt.clear()
-                await self.on_success(*args, **kwargs)
-                return True
-            else:
-                self.debug_print('emit: execute failure')
-                await self.on_failure(*args, **kwargs)
-                return False
+            # prevent emit overlapping
+            async with self._emitlock:
+                async with self._before:
+                    self.debug_print("emit: notifying _before")
+                    self._before.notify_all()
+                self.debug_print("emit: checkout lock")
+                while self._lock.locked():
+                    self.debug_print("emit: locked, waiting...")
+                    async with self._lock:
+                        pass
+                    self.debug_print("emit: unlocked, continuing?")
+                self._ctxargs.extend(args)
+                self._ctxkwargs.update(kwargs)
+                self.debug_print("emit: updated context args")
+                if self._ctxres is not False:
+                    self.debug_print("emit: _ctxres is not False")
+                    async with self._lock:
+                        self.debug_print("emit: handler lock acquired")
+                        for hndid in range(len(self._handlers)):
+                            handler = self._handlers[hndid]
+                            try:
+                                if asyncio.iscoroutinefunction(handler):
+                                    self._ctxres = _res = await handler(self, *args, **kwargs)
+                                else:
+                                    self._ctxres = _res = handler(self, *args, **kwargs)
+                                if isinstance(_res, bool) and not res:
+                                    res = _res
+                                    if not _res:
+                                        break
+                            except Exception as exc:
+                                await self.on_handler_error(hndid, exc, *args, **kwargs)
+                else:
+                    self.debug_print("emit: _ctxres is False")
+                    self._ctxargs.clear()
+                    self._ctxkwargs.clear()
+                async with self._after:
+                    self.debug_print("emit: notifying _after")
+                    self._after.notify_all()
+                while self._lock.locked():
+                    self.debug_print("emit: after lock wait...")
+                    async with self._lock:
+                        pass
+                self.debug_print("emit: end phase")
+                if self._ctxres is not False:
+                    self.debug_print("emit: checkout lock at the end")
+                    async with self._lock:
+                        pass
+                    self.debug_print('emit: lock passed')
+                if isinstance(self._ctxres, bool):
+                    res = self._ctxres
+                if res is not False:
+                    self.debug_print('emit: execute success')
+                    self._evt.set()
+                    self._evt.clear()
+                    await self.on_success(*args, **kwargs)
+                    return True
+                else:
+                    self.debug_print('emit: execute failure')
+                    await self.on_failure(*args, **kwargs)
+                    return False
         except Exception as exc:
             await self.on_error(exc, *args, **kwargs)
 
