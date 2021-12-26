@@ -51,9 +51,9 @@ class AIOHandlerChain:
     def debug_print(self, msg: str):
         pass
 
-    def add_handler(self, afunc: Callable[(Any, ), Coroutine[Any, Any, Any]]) -> bool:
+    def add_handler(self, afunc: Callable[(Any, ), Optional[Coroutine[Any, Any, Any]]]) -> bool:
         """
-        Add coroutine function to this handler chain.
+        Add callable or a coroutine function to this handler chain.
         Return True if successful, False otherwise
         """
         if afunc not in self._handlers:
@@ -104,6 +104,27 @@ class AIOHandlerChain:
         finally:
             _cond.release()
 
+    @asynccontextmanager
+    async def emit_and_handle(self, *args, before=False, **kwargs) -> AsyncGenerator[Any, Callable[(Optional[bool], ), Tuple[bool, list, dict]]]:
+        """
+        Unlike wait_and_handle(), it doesn't block until an event occurs. Instead, it emits
+        an event and handles it in some way when the handlers are not necessarily required
+        to be triggered. Using this way of event emission gives an opportunity to determine
+        whether or not this event emission is successful.
+        Returns a handle which works in the same way as by wait_and_handle()
+        """
+        _cond = self._before if before else self._after
+        self.debug_print("emit_and_handle: before try")
+        try:
+            await _cond.acquire()
+            asyncio.create_task(self.emit(*args, **kwargs))
+            self.debug_print("emit_and_handle: lock acquired, waiting...")
+            await _cond.wait()
+            yield self._ctxhandle
+            self.debug_print("emit_and_handle: wait complete")
+        finally:
+            _cond.release()
+
     async def __call__(self, *args, **kwargs) -> bool:
         """
         Shorthand for self.emit(*args, **kwargs)
@@ -128,9 +149,9 @@ class AIOHandlerChain:
                     self.debug_print("emit: notifying _before")
                     self._before.notify_all()
                 self.debug_print("emit: checkout lock")
-                while self._lock.locked():
+                while self._before.locked():
                     self.debug_print("emit: locked, waiting...")
-                    async with self._lock:
+                    async with self._before:
                         pass
                     self.debug_print("emit: unlocked, continuing?")
                 self._ctxargs.extend(args)
@@ -160,9 +181,9 @@ class AIOHandlerChain:
                 async with self._after:
                     self.debug_print("emit: notifying _after")
                     self._after.notify_all()
-                while self._lock.locked():
+                while self._after.locked():
                     self.debug_print("emit: after lock wait...")
-                    async with self._lock:
+                    async with self._after:
                         pass
                 self.debug_print("emit: end phase")
                 if self._ctxres is not False:
