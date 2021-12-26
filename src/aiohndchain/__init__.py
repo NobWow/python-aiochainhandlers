@@ -26,6 +26,7 @@ class AIOHandlerChain:
         self._ctxargs = []
         self._ctxkwargs = {}
         self._ctxres: Optional[bool] = None
+        self._last_res = None
         self._emitlock = asyncio.Lock()
 
     def isCancellable(self) -> bool:
@@ -41,9 +42,15 @@ class AIOHandlerChain:
         Returns availability state and arguments, keyword arguments of the event.
         """
         _res = True
+        if self._ctxres is not None:
+            self.debug_print("_ctxhandle: _ctxres is not None, skip!")
+        if not self._cancellable:
+            self.debug_print('_ctxhandle: event is not cancellable')
+        if res is None:
+            self.debug_print('_ctxhandle: res is None!')
         if self._ctxres is None and res is not None and self._cancellable:
-            self._ctxres = res
-            _res = res
+            _res = self._ctxres = res
+            self.debug_print('_ctxhandle: self._ctxres updated to %s' % self._ctxres)
         elif self._ctxres is False:
             _res = False
         return _res, self._ctxargs, self._ctxkwargs
@@ -95,6 +102,10 @@ class AIOHandlerChain:
         """
         _cond = self._before if before else self._after
         self.debug_print("wait_and_handle: before try")
+        if _cond.locked():
+            self.debug_print("wait_and_handle: condition is locked, passing...")
+            async with _cond:
+                pass
         try:
             await _cond.acquire()
             self.debug_print("wait_and_handle: lock acquired, waiting...")
@@ -105,7 +116,7 @@ class AIOHandlerChain:
             _cond.release()
 
     @asynccontextmanager
-    async def emit_and_handle(self, *args, before=False, **kwargs) -> AsyncGenerator[Any, Callable[(Optional[bool], ), Tuple[bool, list, dict]]]:
+    async def emit_and_handle(self, *args, before=False, kwargs={}) -> AsyncGenerator[Any, Callable[(Optional[bool], ), Tuple[bool, list, dict]]]:
         """
         Unlike wait_and_handle(), it doesn't block until an event occurs. Instead, it emits
         an event and handles it in some way when the handlers are not necessarily required
@@ -113,17 +124,23 @@ class AIOHandlerChain:
         whether or not this event emission is successful.
         Returns a handle which works in the same way as by wait_and_handle()
         """
-        _cond = self._before if before else self._after
         self.debug_print("emit_and_handle: before try")
-        try:
-            await _cond.acquire()
-            asyncio.create_task(self.emit(*args, **kwargs))
-            self.debug_print("emit_and_handle: lock acquired, waiting...")
-            await _cond.wait()
-            yield self._ctxhandle
-            self.debug_print("emit_and_handle: wait complete")
-        finally:
-            _cond.release()
+        if self._emitlock.locked():
+            async with self._emitlock:
+                pass
+        if before:
+            async with self._emitlock:
+                async with self._lock:
+                    self.debug_print("emit_and_handle (before): acquired EMIT lock, doing all the stuff before emitting")
+                    yield self._ctxhandle
+            await self.emit(*args, **kwargs)
+        else:
+            async with self._after:
+                asyncio.create_task(self.emit(*args, **kwargs))
+                self.debug_print("emit_and_handle (after): lock acquired, waiting...")
+                await self._after.wait()  # now emit should notify us, suspend emit() until context code completes
+                yield self._ctxhandle
+                self.debug_print("emit_and_handle (after): wait complete")
 
     async def __call__(self, *args, **kwargs) -> bool:
         """
@@ -139,21 +156,21 @@ class AIOHandlerChain:
         Before acquiring the lock, it waits until this lock is completely unlocked.
         Note: this function will block until all the handlers are executed.
         """
-        self._ctxres = res = None
-        self._ctxargs.clear()
-        self._ctxkwargs.clear()
         try:
+            res = self._ctxres
             # prevent emit overlapping
             async with self._emitlock:
                 async with self._before:
                     self.debug_print("emit: notifying _before")
                     self._before.notify_all()
+                await asyncio.sleep(0)  # pass waiters
                 self.debug_print("emit: checkout lock")
                 while self._before.locked():
                     self.debug_print("emit: locked, waiting...")
                     async with self._before:
                         pass
                     self.debug_print("emit: unlocked, continuing?")
+                    await asyncio.sleep(0)  # pass another dispatcher
                 self._ctxargs.extend(args)
                 self._ctxkwargs.update(kwargs)
                 self.debug_print("emit: updated context args")
@@ -168,7 +185,7 @@ class AIOHandlerChain:
                                     self._ctxres = _res = await handler(self, *args, **kwargs)
                                 else:
                                     self._ctxres = _res = handler(self, *args, **kwargs)
-                                if isinstance(_res, bool) and not res:
+                                if isinstance(self._ctxres, bool) and not res:
                                     res = _res
                                     if not _res:
                                         break
@@ -181,10 +198,12 @@ class AIOHandlerChain:
                 async with self._after:
                     self.debug_print("emit: notifying _after")
                     self._after.notify_all()
+                await asyncio.sleep(0)  # pass waiters
                 while self._after.locked():
                     self.debug_print("emit: after lock wait...")
                     async with self._after:
                         pass
+                    await asyncio.sleep(0)  # pass another dispatcher
                 self.debug_print("emit: end phase")
                 if self._ctxres is not False:
                     self.debug_print("emit: checkout lock at the end")
@@ -205,6 +224,11 @@ class AIOHandlerChain:
                     return False
         except Exception as exc:
             await self.on_error(exc, *args, **kwargs)
+        finally:
+            self._last_res = self._ctxres
+            self._ctxres = None
+            self._ctxargs.clear()
+            self._ctxkwargs.clear()
 
     async def on_success(self, *args, **kwargs):
         """
