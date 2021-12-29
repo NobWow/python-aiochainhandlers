@@ -1,7 +1,7 @@
 import asyncio
 # from collections import defaultdict
 from contextlib import asynccontextmanager
-from typing import MutableSequence, Coroutine, Callable, Any, Optional, AsyncGenerator, Tuple
+from typing import MutableSequence, Coroutine, Callable, Any, Optional, AsyncGenerator, Tuple, Mapping
 
 
 class AIOHandlerChain:
@@ -45,12 +45,6 @@ class AIOHandlerChain:
         Returns availability state and arguments, keyword arguments of the event.
         """
         _res = True
-        if self._ctxres is not None:
-            self.debug_print("_ctxhandle: _ctxres is not None, skip!")
-        if not self._cancellable:
-            self.debug_print('_ctxhandle: event is not cancellable')
-        if res is None:
-            self.debug_print('_ctxhandle: res is None!')
         if self._ctxres is None and res is not None and self._cancellable:
             _res = self._ctxres = res
             self.debug_print('_ctxhandle: self._ctxres updated to %s' % self._ctxres)
@@ -59,6 +53,7 @@ class AIOHandlerChain:
         return _res, self._ctxargs, self._ctxkwargs
 
     def debug_print(self, msg: str):
+        """For developers. Do whatever to display a debug print. Defaults to nothing"""
         pass
 
     def add_handler(self, afunc: Callable[(Any, ), Optional[Coroutine[Any, Any, Any]]]) -> bool:
@@ -89,7 +84,7 @@ class AIOHandlerChain:
         await self._evt.wait()
 
     @asynccontextmanager
-    async def wait_and_handle(self, *, before=False) -> AsyncGenerator[Any, Callable[(Optional[bool], ), Tuple[bool, list, dict]]]:
+    async def wait_and_handle(self, *, kwarg_predicate: Optional[Mapping[Any, Any]] = None, predicate: Optional[Callable[(list, dict), bool]] = None, before=False) -> AsyncGenerator[Any, Callable[(Optional[bool], ), Tuple[bool, list, dict]]]:
         """
         Blocks until this event emits and returns a context manager with handle after
         the handler chain.
@@ -102,6 +97,7 @@ class AIOHandlerChain:
         If before=True, waits until this event emits before executing event handlers,
         in this case when False is passed into handle, an entire handler chain won't
         be executed and this event will be cancelled.
+        If predicate is specified, waits until specified predicate becomes true
         """
         _cond = self._before if before else self._after
         self.debug_print("wait_and_handle: before try")
@@ -112,7 +108,21 @@ class AIOHandlerChain:
         try:
             await _cond.acquire()
             self.debug_print("wait_and_handle: lock acquired, waiting...")
-            await _cond.wait()
+            _predicate_available = isinstance(predicate, Callable)
+            _kwargp_available = isinstance(kwarg_predicate, Mapping)
+            if not _predicate_available:
+                def predicate(*x):
+                    return None
+            if _predicate_available or _kwargp_available:
+                def _predicate() -> bool:
+                    _kwargp_res = False
+                    if _kwargp_available:
+                        # return True if whole kwarg predicate matches
+                        _kwargp_res = kwarg_predicate.items() <= self._ctxkwargs.items()
+                    return predicate(self._ctxargs, self._ctxkwargs) or _kwargp_res
+                await _cond.wait_for(_predicate)
+            else:
+                await _cond.wait()
             self.debug_print("wait_and_handle: wait complete")
             yield self._ctxhandle
         finally:
@@ -173,11 +183,13 @@ class AIOHandlerChain:
             res = self._ctxres
             # prevent emit overlapping
             async with self._emitlock:
+                self.debug_print("emit: updated context args")
+                self._ctxargs.extend(args)
+                self._ctxkwargs.update(kwargs)
                 async with self._before:
                     self.debug_print("emit: notifying _before")
                     self._before.notify_all()
                     await asyncio.sleep(0)  # pass waiters
-                await asyncio.sleep(0)  # pass waiters
                 self.debug_print("emit: checkout lock")
                 while self._before.locked():
                     self.debug_print("emit: locked, waiting...")
@@ -185,9 +197,6 @@ class AIOHandlerChain:
                         pass
                     self.debug_print("emit: unlocked, continuing?")
                     await asyncio.sleep(0)  # pass another dispatcher
-                self._ctxargs.extend(args)
-                self._ctxkwargs.update(kwargs)
-                self.debug_print("emit: updated context args")
                 if self._ctxres is not False:
                     self.debug_print("emit: _ctxres is not False")
                     async with self._lock:
@@ -213,7 +222,6 @@ class AIOHandlerChain:
                     self.debug_print("emit: notifying _after")
                     self._after.notify_all()
                     await asyncio.sleep(0)  # pass waiters
-                await asyncio.sleep(0)  # pass waiters
                 while self._after.locked():
                     self.debug_print("emit: after lock wait...")
                     async with self._after:
