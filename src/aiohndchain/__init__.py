@@ -21,7 +21,7 @@ class AIOHandlerChain:
             event = asyncio.Event()
         if not lock:
             lock = asyncio.Lock()
-        self._handlers: MutableSequence[Callable[(type(self), ...), Coroutine[Any, Any, Any]]] = []
+        self._handlers: MutableSequence[Callable[[type(self), ...], Coroutine[Any, Any, Any]]] = []
         self._lock = lock
         self._evt = event
         self._cancellable = cancellable
@@ -56,7 +56,7 @@ class AIOHandlerChain:
         """For developers. Do whatever to display a debug print. Defaults to nothing"""
         pass
 
-    def add_handler(self, afunc: Callable[(Any, ), Optional[Coroutine[Any, Any, Any]]]) -> bool:
+    def add_handler(self, afunc: Callable[[Any], Optional[Coroutine[Any, Any, Any]]]) -> bool:
         """
         Add callable or a coroutine function to this handler chain.
         Return True if successful, False otherwise
@@ -84,7 +84,7 @@ class AIOHandlerChain:
         await self._evt.wait()
 
     @asynccontextmanager
-    async def wait_and_handle(self, *, kwarg_predicate: Optional[Mapping[Any, Any]] = None, predicate: Optional[Callable[(list, dict), bool]] = None, before=False) -> AsyncGenerator[Any, Callable[(Optional[bool], ), Tuple[bool, list, dict]]]:
+    async def wait_and_handle(self, *, kwarg_predicate: Optional[Mapping[Any, Any]] = None, predicate: Optional[Callable[[list, dict], bool]] = None, before=False) -> AsyncGenerator[Any, Callable[[Optional[bool]], Tuple[bool, list, dict]]]:
         """
         Blocks until this event emits and returns a context manager with handle after
         the handler chain.
@@ -129,7 +129,7 @@ class AIOHandlerChain:
             _cond.release()
 
     @asynccontextmanager
-    async def emit_and_handle(self, *args, before=False, kwargs: Optional[dict] = None) -> AsyncGenerator[Any, Callable[(Optional[bool], ), Tuple[bool, list, dict]]]:
+    async def emit_and_handle(self, *args, before=False, kwargs: Optional[dict] = None) -> AsyncGenerator[Any, Callable[[Optional[bool]], Tuple[bool, list, dict]]]:
         """
         Unlike wait_and_handle(), it doesn't block until an event occurs. Instead, it emits
         an event and handles it in some way when the handlers are not necessarily required
@@ -183,20 +183,20 @@ class AIOHandlerChain:
             res = self._ctxres
             # prevent emit overlapping
             async with self._emitlock:
-                self.debug_print("emit: updated context args")
+                self.debug_print("emit: checkout lock")
                 self._ctxargs.extend(args)
                 self._ctxkwargs.update(kwargs)
                 async with self._before:
                     self.debug_print("emit: notifying _before")
                     self._before.notify_all()
                     await asyncio.sleep(0)  # pass waiters
-                self.debug_print("emit: checkout lock")
                 while self._before.locked():
                     self.debug_print("emit: locked, waiting...")
                     async with self._before:
                         pass
                     self.debug_print("emit: unlocked, continuing?")
                     await asyncio.sleep(0)  # pass another dispatcher
+                self.debug_print("emit: updated context args")
                 if self._ctxres is not False:
                     self.debug_print("emit: _ctxres is not False")
                     async with self._lock:
