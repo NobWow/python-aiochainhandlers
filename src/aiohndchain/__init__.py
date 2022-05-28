@@ -185,7 +185,9 @@ class AIOHandlerChain:
             async with self._emitlock:
                 self.debug_print("emit: checkout lock")
                 self._ctxargs.extend(args)
+                ctxargs = self._ctxargs
                 self._ctxkwargs.update(kwargs)
+                ctxkwargs = self._ctxkwargs
                 async with self._before:
                     self.debug_print("emit: notifying _before")
                     self._before.notify_all()
@@ -205,15 +207,15 @@ class AIOHandlerChain:
                             handler = self._handlers[hndid]
                             try:
                                 if asyncio.iscoroutinefunction(handler):
-                                    self._ctxres = _res = await handler(self, *args, **kwargs)
+                                    self._ctxres = _res = await handler(self, *ctxargs, **ctxkwargs)
                                 else:
-                                    self._ctxres = _res = handler(self, *args, **kwargs)
+                                    self._ctxres = _res = handler(self, *ctxargs, **ctxkwargs)
                                 if isinstance(self._ctxres, bool) and not res:
                                     res = _res
                                     if not _res:
                                         break
                             except Exception as exc:
-                                await self.on_handler_error(hndid, exc, *args, **kwargs)
+                                await self.on_handler_error(hndid, exc, ctxargs, ctxkwargs)
                 else:
                     self.debug_print("emit: _ctxres is False")
                     self._ctxargs.clear()
@@ -239,14 +241,14 @@ class AIOHandlerChain:
                     self.debug_print('emit: execute success')
                     self._evt.set()
                     self._evt.clear()
-                    await self.on_success(*args, **kwargs)
+                    await self.on_success(*ctxargs, **ctxkwargs)
                     return True
                 else:
                     self.debug_print('emit: execute failure')
-                    await self.on_failure(*args, **kwargs)
+                    await self.on_failure(*ctxargs, **ctxkwargs)
                     return False
         except Exception as exc:
-            await self.on_error(exc, *args, **kwargs)
+            await self.on_error(exc, args, kwargs)
         finally:
             self._ctxres = None
             self._ctxargs.clear()
